@@ -32,6 +32,7 @@ struct user_key_payload {
 
 extern struct key_type key_type_user;
 extern struct key_type key_type_logon;
+extern struct key_type key_type_none;
 
 struct key_preparsed_payload;
 
