@@ -37,17 +37,20 @@
 
 static const char KEY_TRUSTED_PREFIX[] = "trusted:";
 static const char KEY_USER_PREFIX[] = "user:";
+static const char KEY_NONE_PREFIX[] = "none:";
 static const char hash_alg[] = "sha256";
 static const char hmac_alg[] = "hmac(sha256)";
 static const char blkcipher_alg[] = "cbc(aes)";
 static const char key_format_default[] = "default";
 static const char key_format_ecryptfs[] = "ecryptfs";
 static const char key_format_enc32[] = "enc32";
+static const char key_format_unwrappable[] = "unwrappable";
 static unsigned int ivsize;
 static int blksize;
 
 #define KEY_TRUSTED_PREFIX_LEN (sizeof (KEY_TRUSTED_PREFIX) - 1)
 #define KEY_USER_PREFIX_LEN (sizeof (KEY_USER_PREFIX) - 1)
+#define KEY_NONE_PREFIX_LEN (sizeof (KEY_NONE_PREFIX) - 1)
 #define KEY_ECRYPTFS_DESC_LEN 16
 #define HASH_SIZE SHA256_DIGEST_SIZE
 #define MAX_DATA_SIZE 4096
@@ -61,13 +64,14 @@ enum {
 };
 
 enum {
-	Opt_default, Opt_ecryptfs, Opt_enc32, Opt_error
+	Opt_default, Opt_ecryptfs, Opt_enc32, Opt_unwrappable, Opt_error
 };
 
 static const match_table_t key_format_tokens = {
 	{Opt_default, "default"},
 	{Opt_ecryptfs, "ecryptfs"},
 	{Opt_enc32, "enc32"},
+	{Opt_unwrappable, "unwrappable"},
 	{Opt_error, NULL}
 };
 
@@ -125,7 +129,7 @@ static int valid_ecryptfs_desc(const char *ecryptfs_desc)
 /*
  * valid_master_desc - verify the 'key-type:desc' of a new/updated master-key
  *
- * key-type:= "trusted:" | "user:"
+ * key-type:= "trusted:" | "user:" | "none:"
  * desc:= master-key description
  *
  * Verify that 'key-type' is valid and that 'desc' exists. On key update,
@@ -142,6 +146,8 @@ static int valid_master_desc(const char *new_desc, const char *orig_desc)
 		prefix_len = KEY_TRUSTED_PREFIX_LEN;
 	else if (!strncmp(new_desc, KEY_USER_PREFIX, KEY_USER_PREFIX_LEN))
 		prefix_len = KEY_USER_PREFIX_LEN;
+	else if (!strncmp(new_desc, KEY_NONE_PREFIX, KEY_NONE_PREFIX_LEN))
+	  prefix_len = KEY_NONE_PREFIX_LEN;
 	else
 		return -EINVAL;
 
@@ -159,6 +165,7 @@ static int valid_master_desc(const char *new_desc, const char *orig_desc)
  *
  * datablob format:
  * new [<format>] <master-key name> <decrypted data length>
+ * new [<format>] <master-key name> <decrypted data length> <decrypted data>
  * load [<format>] <master-key name> <decrypted data length>
  *     <encrypted iv + data>
  * update <new-master-key name>
@@ -170,7 +177,7 @@ static int valid_master_desc(const char *new_desc, const char *orig_desc)
  */
 static int datablob_parse(char *datablob, const char **format,
 			  char **master_desc, char **decrypted_datalen,
-			  char **hex_encoded_iv)
+			  char **hex_encoded_iv, char **decrypted_data)
 {
 	substring_t args[MAX_OPT_ARGS];
 	int ret = -EINVAL;
@@ -196,6 +203,7 @@ static int datablob_parse(char *datablob, const char **format,
 	switch (key_format) {
 	case Opt_ecryptfs:
 	case Opt_enc32:
+	case Opt_unwrappable:
 	case Opt_default:
 		*format = p;
 		*master_desc = strsep(&datablob, " \t");
@@ -231,6 +239,7 @@ static int datablob_parse(char *datablob, const char **format,
 				"when called from .update method\n", keyword);
 			break;
 		}
+		*decrypted_data = strsep(&datablob, " \t");
 		ret = 0;
 		break;
 	case Opt_load:
@@ -265,9 +274,10 @@ out:
 }
 
 /*
- * datablob_format - format as an ascii string, before copying to userspace
+ * encrypted_datablob_format - format as an ascii string, before copying to
+ * userspace
  */
-static char *datablob_format(struct encrypted_key_payload *epayload,
+static char *encrypted_datablob_format(struct encrypted_key_payload *epayload,
 			     size_t asciiblob_len)
 {
 	char *ascii_buf, *bufp;
@@ -291,6 +301,43 @@ static char *datablob_format(struct encrypted_key_payload *epayload,
 		bufp = hex_byte_pack(bufp, iv[i]);
 out:
 	return ascii_buf;
+}
+
+/*
+ * user_encrypted_datablob_format - format as an ascii string, before copying
+ * to userspace. Will append the decrypted data, if specified.
+ */
+ static char *user_encrypted_datablob_format(struct encrypted_key_payload
+  *epayload, size_t asciiblob_len, bool return_decrypted)
+{
+  char *ascii_buf, *bufp;
+  u8 *iv = epayload->iv;
+  int len;
+  int i;
+
+  ascii_buf = kmalloc(asciiblob_len + 1, GFP_KERNEL);
+  if (!ascii_buf)
+    goto out;
+
+  ascii_buf[asciiblob_len] = '\0';
+
+  /* copy datablob master_desc and datalen strings */
+  len = sprintf(ascii_buf, "%s %s %s ", epayload->format,
+    epayload->master_desc, epayload->datalen);
+
+  /* convert the hex encoded iv, encrypted-data and HMAC to ascii */
+  bufp = &ascii_buf[len];
+  for (i = 0; i < (ivsize + roundup(epayload->decrypted_datalen, blksize) +
+    (HASH_SIZE * 2)) / 2; i++)
+  bufp = hex_byte_pack(bufp, iv[i]);
+  /* convert the decrypted data if specified */
+  if (return_decrypted) {
+    sprintf(ascii_buf, " ");
+    for (i = 0; i < epayload->decrypted_datalen / 2; i++)
+      bufp = hex_byte_pack(bufp, epayload->decrypted_data[i]);
+  }
+out:
+  return ascii_buf;
 }
 
 /*
@@ -321,6 +368,36 @@ static struct key *request_user_key(const char *master_desc, const u8 **master_k
 	*master_keylen = upayload->datalen;
 error:
 	return ukey;
+}
+
+/*
+ * request_none_key - request the none key
+ *
+ * Use a user provided key to encrypt/decrypt an encrypted-key.
+ */
+static struct key *request_none_key(const char *master_desc, const u8 **master_key,
+  size_t *master_keylen)
+{
+  const struct user_key_payload *npayload;
+  struct key *nkey;
+
+  nkey = request_key(&key_type_none, master_desc, NULL);
+  if (IS_ERR(nkey))
+    goto error;
+
+  down_read(&nkey->sem);
+  npayload = user_key_payload_locked(nkey);
+  if (!npayload) {
+    /* key was revoked before we acquired its semaphore */
+    up_read(&nkey->sem);
+    key_put(nkey);
+    nkey = ERR_PTR(-EKEYREVOKED);
+    goto error;
+  }
+  *master_key = npayload->data;
+  *master_keylen = npayload->datalen;
+error:
+  return nkey;
 }
 
 static int calc_hmac(u8 *digest, const u8 *key, unsigned int keylen,
@@ -422,6 +499,10 @@ static struct key *request_master_key(struct encrypted_key_payload *epayload,
 		mkey = request_user_key(epayload->master_desc +
 					KEY_USER_PREFIX_LEN,
 					master_key, master_keylen);
+	} else if (!strncmp(epayload->master_desc, KEY_NONE_PREFIX,
+	  KEY_NONE_PREFIX_LEN)) {
+	  mkey = request_none_key(epayload->master_desc +
+	    KEY_NONE_PREFIX_LEN, master_key, master_keylen);
 	} else
 		goto out;
 
@@ -746,7 +827,7 @@ static void __ekey_init(struct encrypted_key_payload *epayload,
 static int encrypted_init(struct encrypted_key_payload *epayload,
 			  const char *key_desc, const char *format,
 			  const char *master_desc, const char *datalen,
-			  const char *hex_encoded_iv)
+			  const char *hex_encoded_iv, const char *decrypted_data)
 {
 	int ret = 0;
 
@@ -760,21 +841,25 @@ static int encrypted_init(struct encrypted_key_payload *epayload,
 	}
 
 	__ekey_init(epayload, format, master_desc, datalen);
-	if (!hex_encoded_iv) {
-		get_random_bytes(epayload->iv, ivsize);
-
-		get_random_bytes(epayload->decrypted_data,
-				 epayload->decrypted_datalen);
-	} else
-		ret = encrypted_key_decrypt(epayload, format, hex_encoded_iv);
-	return ret;
+  if (hex_encoded_iv) {
+    ret = encrypted_key_decrypt(epayload, format, hex_encoded_iv);
+  } else if (decrypted_data) {
+    get_random_bytes(epayload->iv, ivsize);
+    strcpy(epayload->decrypted_data, decrypted_data);
+  } else {
+    get_random_bytes(epayload->iv, ivsize);
+    get_random_bytes(epayload->decrypted_data, epayload->decrypted_datalen);
+  }
+  return ret;
 }
 
 /*
  * encrypted_instantiate - instantiate an encrypted key
  *
- * Decrypt an existing encrypted datablob or create a new encrypted key
- * based on a kernel random number.
+ * Instantiates the key:
+ * - by decrypting an existing encrypted datablob, or
+ * - by creating a new encrypted key based on a kernel random number, or
+ * - using provided decrypted data.
  *
  * On success, return 0. Otherwise return errno.
  */
@@ -787,6 +872,7 @@ static int encrypted_instantiate(struct key *key,
 	char *master_desc = NULL;
 	char *decrypted_datalen = NULL;
 	char *hex_encoded_iv = NULL;
+  char *decrypted_data = NULL;
 	size_t datalen = prep->datalen;
 	int ret;
 
@@ -799,7 +885,7 @@ static int encrypted_instantiate(struct key *key,
 	datablob[datalen] = 0;
 	memcpy(datablob, prep->data, datalen);
 	ret = datablob_parse(datablob, &format, &master_desc,
-			     &decrypted_datalen, &hex_encoded_iv);
+			     &decrypted_datalen, &hex_encoded_iv, &decrypted_data);
 	if (ret < 0)
 		goto out;
 
@@ -810,7 +896,7 @@ static int encrypted_instantiate(struct key *key,
 		goto out;
 	}
 	ret = encrypted_init(epayload, key->description, format, master_desc,
-			     decrypted_datalen, hex_encoded_iv);
+			     decrypted_datalen, hex_encoded_iv, decrypted_data);
 	if (ret < 0) {
 		kfree_sensitive(epayload);
 		goto out;
@@ -860,7 +946,7 @@ static int encrypted_update(struct key *key, struct key_preparsed_payload *prep)
 
 	buf[datalen] = 0;
 	memcpy(buf, prep->data, datalen);
-	ret = datablob_parse(buf, &format, &new_master_desc, NULL, NULL);
+	ret = datablob_parse(buf, &format, &new_master_desc, NULL, NULL, NULL);
 	if (ret < 0)
 		goto out;
 
@@ -935,7 +1021,7 @@ static long encrypted_read(const struct key *key, char *buffer,
 	if (ret < 0)
 		goto out;
 
-	ascii_buf = datablob_format(epayload, asciiblob_len);
+	ascii_buf = encrypted_datablob_format(epayload, asciiblob_len);
 	if (!ascii_buf) {
 		ret = -ENOMEM;
 		goto out;
@@ -957,6 +1043,77 @@ out:
 }
 
 /*
+ * user_encrypted_read - format and copy out the encrypted data
+ *
+ * The resulting datablob format is:
+ * <master-key name> <decrypted data length> <encrypted iv> <encrypted data>
+ *
+ * Unless the format is 'unwrappable':
+ * <master-key name> <decrypted data length> <encrypted iv> <encrypted data> <decrypted data>
+ *
+ * On success, return to userspace the encrypted key datablob size.
+ */
+static long user_encrypted_read(const struct key *key, char *buffer,
+      size_t buflen)
+{
+  struct encrypted_key_payload *epayload;
+  struct key *mkey;
+  const u8 *master_key;
+  size_t master_keylen;
+  char derived_key[HASH_SIZE];
+  char *ascii_buf;
+  size_t asciiblob_len;
+  int ret;
+
+  epayload = dereference_key_locked(key);
+
+  /* returns the hex encoded iv, encrypted-data, and hmac as ascii */
+  asciiblob_len = epayload->datablob_len + ivsize + 1
+    + roundup(epayload->decrypted_datalen, blksize)
+    + (HASH_SIZE * 2)
+    + (strcmp(epayload->format, key_format_unwrappable) ? epayload->decrypted_datalen : 0);
+
+  if (!buffer || buflen < asciiblob_len)
+    return asciiblob_len;
+
+  mkey = request_master_key(epayload, &master_key, &master_keylen);
+  if (IS_ERR(mkey))
+    return PTR_ERR(mkey);
+
+  ret = get_derived_key(derived_key, ENC_KEY, master_key, master_keylen);
+  if (ret < 0)
+    goto out;
+
+  ret = derived_key_encrypt(epayload, derived_key, sizeof derived_key);
+  if (ret < 0)
+    goto out;
+
+  ret = datablob_hmac_append(epayload, master_key, master_keylen);
+  if (ret < 0)
+    goto out;
+
+  ascii_buf = user_encrypted_datablob_format(epayload, asciiblob_len, strcmp(epayload->format, key_format_unwrappable));
+  if (!ascii_buf) {
+    ret = -ENOMEM;
+    goto out;
+  }
+
+  up_read(&mkey->sem);
+  key_put(mkey);
+  memzero_explicit(derived_key, sizeof(derived_key));
+
+  memcpy(buffer, ascii_buf, asciiblob_len);
+  kfree_sensitive(ascii_buf);
+
+  return asciiblob_len;
+out:
+  up_read(&mkey->sem);
+  key_put(mkey);
+  memzero_explicit(derived_key, sizeof(derived_key));
+  return ret;
+}
+
+/*
  * encrypted_destroy - clear and free the key's payload
  */
 static void encrypted_destroy(struct key *key)
@@ -974,6 +1131,28 @@ struct key_type key_type_encrypted = {
 };
 EXPORT_SYMBOL_GPL(key_type_encrypted);
 
+struct key_type key_type_user_encrypted = {
+  .name = "user_encrypted",
+  .instantiate = encrypted_instantiate,
+  .update = encrypted_update,
+  .destroy = encrypted_destroy,
+  .describe = user_describe,
+  .read = user_encrypted_read,
+};
+EXPORT_SYMBOL_GPL(key_type_user_encrypted);
+
+struct key_type key_type_none = {
+  .name    = "none",
+  .preparse   = user_preparse,
+  .free_preparse  = user_free_preparse,
+  .instantiate  = generic_key_instantiate,
+  .update    = user_update,
+  .revoke    = user_revoke,
+  .destroy  = user_destroy,
+  .describe   = user_describe,
+};
+EXPORT_SYMBOL_GPL(key_type_none);
+
 static int __init init_encrypted(void)
 {
 	int ret;
@@ -985,13 +1164,19 @@ static int __init init_encrypted(void)
 		return PTR_ERR(hash_tfm);
 	}
 
-	ret = aes_get_sizes();
-	if (ret < 0)
-		goto out;
-	ret = register_key_type(&key_type_encrypted);
-	if (ret < 0)
-		goto out;
-	return 0;
+  ret = aes_get_sizes();
+  if (ret < 0)
+    goto out;
+  ret = register_key_type(&key_type_encrypted);
+  if (ret < 0)
+    goto out;
+  ret = register_key_type(&key_type_user_encrypted);
+  if (ret < 0)
+    goto out;
+  ret = register_key_type(&key_type_none);
+  if (ret < 0)
+    goto out;
+  return 0;
 out:
 	crypto_free_shash(hash_tfm);
 	return ret;
