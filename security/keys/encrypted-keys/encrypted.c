@@ -821,8 +821,9 @@ static void __ekey_init(struct encrypted_key_payload *epayload,
 /*
  * encrypted_init - initialize an encrypted key
  *
- * For a new key, use a random number for both the iv and data
- * itself.  For an old key, decrypt the hex encoded data.
+ * For a new key, use the decrypted data or a random number for both the
+ * iv and data itself if decrypted data is not provided. For an old key,
+ * decrypt the hex encoded data.
  */
 static int encrypted_init(struct encrypted_key_payload *epayload,
 			  const char *key_desc, const char *format,
@@ -845,7 +846,7 @@ static int encrypted_init(struct encrypted_key_payload *epayload,
     ret = encrypted_key_decrypt(epayload, format, hex_encoded_iv);
   } else if (decrypted_data) {
     get_random_bytes(epayload->iv, ivsize);
-    strcpy(epayload->decrypted_data, decrypted_data);
+    memcpy(epayload->decrypted_data, decrypted_data, payload->decrypted_datalen);
   } else {
     get_random_bytes(epayload->iv, ivsize);
     get_random_bytes(epayload->decrypted_data, epayload->decrypted_datalen);
@@ -872,7 +873,7 @@ static int encrypted_instantiate(struct key *key,
 	char *master_desc = NULL;
 	char *decrypted_datalen = NULL;
 	char *hex_encoded_iv = NULL;
-  char *decrypted_data = NULL;
+	char *decrypted_data = NULL;
 	size_t datalen = prep->datalen;
 	int ret;
 
